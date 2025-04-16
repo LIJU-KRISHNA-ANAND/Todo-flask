@@ -1,40 +1,48 @@
+import os
+import json
+import base64
 import firebase_admin
 from firebase_admin import credentials, firestore
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import os
-from config import FIREBASE_CREDENTIALS_PATH, DEBUG, SECRET_KEY
+
+from dotenv import load_dotenv
+load_dotenv() 
 
 app = Flask(__name__)
-app.config.from_object('config')
+CORS(app)
 
-cred = credentials.Certificate(FIREBASE_CREDENTIALS_PATH)
+app.secret_key = os.getenv('SECRET_KEY', 'default-secret')
+app.debug = os.getenv('DEBUG', 'False').lower() in ['true', '1']
+
+firebase_key_path = os.getenv('FIREBASE_CREDENTIALS_PATH')
+
+firebase_key_base64 = os.getenv('FIREBASE_KEY_BASE64')
+
+if firebase_key_base64:
+    firebase_key_json = base64.b64decode(firebase_key_base64).decode('utf-8')
+    cred = credentials.Certificate(json.loads(firebase_key_json))
+elif firebase_key_path:
+    cred = credentials.Certificate(firebase_key_path)
+else:
+    raise ValueError("Firebase credentials not provided!")
+
 firebase_admin.initialize_app(cred)
-
 db_firestore = firestore.client()
 
-CORS(app)
+# ==== API Routes ====
 
 @app.route('/api/tasks', methods=['GET'])
 def get_tasks():
     tasks_ref = db_firestore.collection("tasks")
     tasks = tasks_ref.stream()
-
-    task_list = []
-    for task in tasks:
-        task_data = task.to_dict()
-        task_list.append(task_data)
-
-    return jsonify(task_list)
+    return jsonify([task.to_dict() for task in tasks])
 
 @app.route('/api/tasks/<int:task_id>', methods=['GET'])
 def get_task(task_id):
     task_ref = db_firestore.collection("tasks").document(str(task_id))
     task = task_ref.get()
-
-    if task.exists:
-        return jsonify(task.to_dict())
-    return ('Task not found', 404)
+    return jsonify(task.to_dict()) if task.exists else ('Task not found', 404)
 
 @app.route('/api/tasks', methods=['POST'])
 def add_task():
@@ -46,19 +54,13 @@ def add_task():
         "completed": data.get('completed', False),
         "position": data.get('position', 0)
     }
-
-    # Add to Firestore collection
-    doc_ref = db_firestore.collection("tasks").document()
-    doc_ref.set(new_task)
-
+    db_firestore.collection("tasks").document().set(new_task)
     return jsonify(new_task), 201
 
 @app.route('/api/tasks/<int:task_id>', methods=['PUT'])
 def update_task(task_id):
     task_ref = db_firestore.collection("tasks").document(str(task_id))
-    task = task_ref.get()
-
-    if not task.exists:
+    if not task_ref.get().exists:
         return ('Task not found', 404)
 
     data = request.json
@@ -76,9 +78,7 @@ def update_task(task_id):
 @app.route('/api/tasks/<int:task_id>', methods=['DELETE'])
 def delete_task(task_id):
     task_ref = db_firestore.collection("tasks").document(str(task_id))
-    task = task_ref.get()
-
-    if not task.exists:
+    if not task_ref.get().exists:
         return ('Task not found', 404)
 
     task_ref.delete()
@@ -88,13 +88,11 @@ def delete_task(task_id):
 def toggle_task(task_id):
     task_ref = db_firestore.collection("tasks").document(str(task_id))
     task = task_ref.get()
-
     if not task.exists:
         return ('Task not found', 404)
 
     task_data = task.to_dict()
     task_data['completed'] = not task_data['completed']
-    
     task_ref.update(task_data)
     return jsonify(task_data)
 
@@ -103,15 +101,14 @@ def move_task(task_id):
     direction = request.json.get("direction")
     task_ref = db_firestore.collection("tasks").document(str(task_id))
     task = task_ref.get()
-
     if not task.exists:
         return ('Task not found', 404)
 
-    tasks_ref = db_firestore.collection("tasks")
-    tasks = tasks_ref.order_by("position").stream()
+    task_data = task.to_dict()
+    tasks = db_firestore.collection("tasks").order_by("position").stream()
+    task_list = [t.to_dict() for t in tasks]
 
-    task_list = [task.to_dict() for task in tasks]
-    index = next((i for i, t in enumerate(task_list) if t['position'] == task.to_dict()['position']), None)
+    index = next((i for i, t in enumerate(task_list) if t['position'] == task_data['position']), None)
 
     if direction == "up" and index > 0:
         other_task = task_list[index - 1]
@@ -121,18 +118,17 @@ def move_task(task_id):
         return ('Invalid move', 400)
 
     # Swap positions
-    task_data = task.to_dict()
-    other_task_data = other_task
-    task_data['position'], other_task_data['position'] = other_task_data['position'], task_data['position']
-
-    # Update Firestore with new positions
+    task_data['position'], other_task['position'] = other_task['position'], task_data['position']
     task_ref.update(task_data)
-    tasks_ref.document(str(other_task['position'])).update(other_task_data)
 
-    return jsonify({
-        "moved": task_data,
-        "swapped_with": other_task_data
-    })
+    # Find and update the other task by its position
+    for doc in db_firestore.collection("tasks").stream():
+        if doc.to_dict()['position'] == other_task['position']:
+            db_firestore.collection("tasks").document(doc.id).update(other_task)
+            break
 
+    return jsonify({"moved": task_data, "swapped_with": other_task})
+
+# ==== Run the App ====
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=app.debug)
