@@ -32,6 +32,10 @@ db_firestore = firestore.client()
 
 # ==== API Routes ====
 
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({"message": "Flask Todo API is live!"})
+
 @app.route('/api/tasks', methods=['GET'])
 def get_tasks():
     tasks_ref = db_firestore.collection("tasks")
